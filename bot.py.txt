@@ -1,0 +1,144 @@
+import os
+import sqlite3
+from datetime import datetime, date
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils import executor
+API_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot)
+conn = sqlite3.connect('delivery.db')
+cursor = conn.cursor()
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    orders INTEGER DEFAULT 0,
+    money REAL DEFAULT 0
+)
+''')
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    amount REAL,
+    date TEXT
+)
+''')
+conn.commit()
+MILESTONES = [
+    (10,   "🌱 Новачок"),
+    (30,   "⚡ Активний"),
+    (90,   "🥉 Бронза"),
+    (270,  "🥈 Срібло"),
+    (810,  "🥇 Золото"),
+    (2430, "💎 Діамант"),
+    (7000, "👑 Легенда"),
+]
+def get_rank(orders):
+    rank = None
+    for threshold, title in MILESTONES:
+        if orders >= threshold:
+            rank = title
+    return rank
+def get_next_milestone(orders):
+    for threshold, title in MILESTONES:
+        if orders < threshold:
+            return threshold, title
+    return None, None
+def get_quarter_start():
+    today = date.today()
+    adjusted = (today.month - 4) % 12
+    start_month = (adjusted // 3) * 3
+    start_month = (start_month + 4 - 1) % 12 + 1
+    return date(today.year, start_month, 1).strftime("%Y-%m-%d")
+kb = ReplyKeyboardMarkup(resize_keyboard=True)
+kb.add(KeyboardButton("➕ Додати доставку"))
+kb.add(KeyboardButton("📊 Профіль"))
+kb.add(KeyboardButton("📅 Сьогодні"))
+kb.add(KeyboardButton("🏆 Нагороди"))
+kb.add(KeyboardButton("🗑 Очистити"))
+@dp.message_handler(commands=['start'])
+async def start(message: types.Message):
+    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (message.from_user.id,))
+    conn.commit()
+    await message.answer("🚀 Бот запущено!", reply_markup=kb)
+@dp.message_handler(lambda message: message.text == "➕ Додати доставку")
+async def add_prompt(message: types.Message):
+    await message.answer("Введи суму доставки (наприклад: 120)")
+@dp.message_handler(lambda message: message.text.replace('.', '', 1).isdigit())
+async def add_delivery(message: types.Message):
+    amount = float(message.text)
+    user_id = message.from_user.id
+    today = datetime.now().strftime("%Y-%m-%d")
+    cursor.execute("SELECT orders FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    old_orders = row[0] if row else 0
+    cursor.execute("UPDATE users SET orders = orders + 1, money = money + ? WHERE user_id = ?", (amount, user_id))
+    cursor.execute("INSERT INTO deliveries (user_id, amount, date) VALUES (?, ?, ?)", (user_id, amount, today))
+    conn.commit()
+    new_orders = old_orders + 1
+    await message.answer(f"✅ Додано {amount} грн")
+    for threshold, title in MILESTONES:
+        if old_orders < threshold <= new_orders:
+            await message.answer(
+                f"🎉 Вітаємо! Ти досяг {threshold} доставок!\n"
+                f"Нова нагорода: {title}"
+            )
+@dp.message_handler(lambda message: message.text == "📊 Профіль")
+async def profile(message: types.Message):
+    user_id = message.from_user.id
+    cursor.execute("SELECT orders, money FROM users WHERE user_id = ?", (user_id,))
+    data = cursor.fetchone()
+    quarter_start = get_quarter_start()
+    cursor.execute("SELECT COUNT(*) FROM deliveries WHERE user_id = ? AND date >= ?", (user_id, quarter_start))
+    period_orders = cursor.fetchone()[0] or 0
+    if data:
+        total_orders, money = data
+        rank = get_rank(total_orders)
+        next_threshold, next_title = get_next_milestone(total_orders)
+        rank_line = f"🏅 Нагорода: {rank}\n" if rank else ""
+        if next_threshold:
+            next_line = f"⬆️ До '{next_title}': ще {next_threshold - total_orders} доставок\n"
+        else:
+            next_line = "🏆 Максимальна нагорода досягнута!\n"
+        await message.answer(
+            f"📦 Всього доставок: {total_orders}\n"
+            f"🔄 За цей квартал: {period_orders}\n"
+            f"💰 Зароблено: {round(money, 2)} грн\n"
+            f"{rank_line}{next_line}"
+        )
+@dp.message_handler(lambda message: message.text == "📅 Сьогодні")
+async def today_stats(message: types.Message):
+    user_id = message.from_user.id
+    today = datetime.now().strftime("%Y-%m-%d")
+    cursor.execute("SELECT COUNT(*), SUM(amount) FROM deliveries WHERE user_id = ? AND date = ?", (user_id, today))
+    data = cursor.fetchone()
+    orders = data[0] or 0
+    money = data[1] or 0
+    await message.answer(
+        f"📅 За сьогодні:\n"
+        f"📦 Доставок: {orders}\n"
+        f"💰 Зароблено: {round(money, 2)} грн"
+    )
+@dp.message_handler(lambda message: message.text == "🏆 Нагороди")
+async def awards(message: types.Message):
+    user_id = message.from_user.id
+    cursor.execute("SELECT orders FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    total_orders = row[0] if row else 0
+    lines = ["🏆 Список нагород:\n"]
+    for threshold, title in MILESTONES:
+        if total_orders >= threshold:
+            lines.append(f"✅ {title} — {threshold} доставок")
+        else:
+            lines.append(f"🔒 {title} — {threshold} доставок (ще {threshold - total_orders})")
+    await message.answer("\n".join(lines))
+@dp.message_handler(lambda message: message.text == "🗑 Очистити")
+async def reset(message: types.Message):
+    user_id = message.from_user.id
+    cursor.execute("UPDATE users SET orders = 0, money = 0 WHERE user_id = ?", (user_id,))
+    cursor.execute("DELETE FROM deliveries WHERE user_id = ?", (user_id,))
+    conn.commit()
+    await message.answer("♻️ Дані очищено")
+if __name__ == '__main__':
+    executor.start_polling(dp, skip_updates=True)
